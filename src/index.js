@@ -34,5 +34,14 @@ const db = require('./db');
 const { restoreTimersFromDB } = require('./services/kickScheduler');
 restoreTimersFromDB(db);
 
+const { LIVEKIT_ENABLED } = require('./config/livekit');
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Backend running on port ${PORT}`);
+  console.log(
+    LIVEKIT_ENABLED
+      ? '[livekit] Real LiveKit API enabled'
+      : '[livekit] Stub mode — set LIVEKIT_ENABLED=true in .env to connect LiveKit Cloud',
+  );
+});

@@ -3,6 +3,9 @@ const router  = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const db = require('../db');
 const authMiddleware = require('../middleware/auth');
+const { scheduleKick, cancelKick } = require('../services/kickScheduler');
+
+const EXT_PAYMENT_PREFIX = 'ESEWA-STUB-EXT-';
 
 /**
  * GET /payment/tiers
@@ -90,8 +93,10 @@ router.post('/webhook', (req, res) => {
     }
   
     if (status === 'COMPLETE') {
-      db.prepare(`UPDATE slots SET payment_status = 'completed', payment_ref = ? WHERE payment_ref = ?`)
-        .run(transaction_id || payment_ref, payment_ref);
+      // Keep payment_ref unchanged — the app polls with the original ESEWA-STUB-* ref
+      db.prepare(`UPDATE slots SET payment_status = 'completed' WHERE payment_ref = ?`).run(
+        payment_ref,
+      );
       return res.json({ success: true });
     }
   
@@ -109,12 +114,26 @@ router.get('/status/:ref', authMiddleware, (req, res) => {
     .get(req.params.ref);
   if (!slot) return res.status(404).json({ error: 'Not found' });
 
-  // Only return what the app needs — don't expose internal fields
-  res.json({
+  const body = {
     payment_status: slot.payment_status,
     tier_id: slot.tier_id,
     room_id: slot.room_id,
-  });
+  };
+
+  if (
+    req.params.ref.startsWith(EXT_PAYMENT_PREFIX) &&
+    (slot.payment_status === 'completed' || slot.payment_status === 'applied')
+  ) {
+    const active = db.prepare(`
+      SELECT ends_at FROM slots
+      WHERE room_id = ? AND user_id = ? AND is_active = 1
+    `).get(slot.room_id, slot.user_id);
+    if (active) {
+      body.new_ends_at = active.ends_at;
+    }
+  }
+
+  res.json(body);
 });
 
 /**
@@ -149,7 +168,7 @@ router.post('/extend', authMiddleware, (req, res) => {
 
   // Simulate eSewa 2s delay
   setTimeout(() => {
-    simulateEsewaWebhook(payment_ref, { isExtension: true, existingSlotId: activeSlot.id });
+    simulateEsewaWebhook(payment_ref);
   }, 2000);
 
   res.json({
@@ -163,17 +182,77 @@ router.post('/extend', authMiddleware, (req, res) => {
 
 // ─── Internal stub helper ────────────────────────────────────────────────────
 
-function simulateEsewaWebhook(payment_ref, meta = {}) {
-    // Internal call — attach the secret just like real eSewa would
-    const axios = require('axios');
-    axios.post(`http://localhost:${process.env.PORT || 3000}/payment/webhook`, {
-      payment_ref,
-      status: 'COMPLETE',
-      transaction_id: `TXN-${require('uuid').v4().toUpperCase()}`,
-      ...meta,
-    }, {
-      headers: { 'x-esewa-secret': process.env.WEBHOOK_SECRET }
-    }).catch(e => console.error('[simulateEsewaWebhook] Self-call failed:', e.message));
+function applySlotExtension(extensionPaymentRef) {
+  const extSlot = db.prepare('SELECT * FROM slots WHERE payment_ref = ?').get(
+    extensionPaymentRef,
+  );
+  if (!extSlot) {
+    return null;
   }
+
+  const tier = db.prepare('SELECT * FROM slot_tiers WHERE id = ?').get(extSlot.tier_id);
+  const active = db.prepare(`
+    SELECT s.*, r.name as room_name
+    FROM slots s
+    JOIN rooms r ON s.room_id = r.id
+    WHERE s.room_id = ? AND s.user_id = ? AND s.is_active = 1
+  `).get(extSlot.room_id, extSlot.user_id);
+
+  if (!tier || !active) {
+    console.warn('[payment] No active slot to extend for', extensionPaymentRef);
+    return null;
+  }
+
+  const newEndsAt = active.ends_at + tier.duration_seconds * 1000;
+  db.prepare('UPDATE slots SET ends_at = ? WHERE id = ?').run(newEndsAt, active.id);
+
+  cancelKick(active.payment_ref);
+  scheduleKick({
+    roomName: active.room_name,
+    participantIdentity: `user_${active.user_id}`,
+    paymentRef: active.payment_ref,
+    endsAt: newEndsAt,
+    onKick: () => {
+      db.prepare('UPDATE slots SET is_active = 0 WHERE id = ?').run(active.id);
+    },
+  });
+
+  db.prepare(`UPDATE slots SET payment_status = 'applied' WHERE payment_ref = ?`).run(
+    extensionPaymentRef,
+  );
+
+  console.log(
+    `[payment] Extended slot ${active.id} by ${tier.duration_seconds}s → ends ${newEndsAt}`,
+  );
+  return newEndsAt;
+}
+
+function completeStubPayment(payment_ref) {
+  const slot = db.prepare('SELECT * FROM slots WHERE payment_ref = ?').get(payment_ref);
+  if (!slot) {
+    console.warn('[payment] Stub complete: slot not found for', payment_ref);
+    return false;
+  }
+  if (slot.payment_status !== 'pending') {
+    return true;
+  }
+  db.prepare(`UPDATE slots SET payment_status = 'completed' WHERE payment_ref = ?`).run(
+    payment_ref,
+  );
+  console.log('[payment] Stub payment completed:', payment_ref);
+
+  if (payment_ref.startsWith(EXT_PAYMENT_PREFIX)) {
+    applySlotExtension(payment_ref);
+  }
+  return true;
+}
+
+function simulateEsewaWebhook(payment_ref) {
+  try {
+    completeStubPayment(payment_ref);
+  } catch (e) {
+    console.error('[simulateEsewaWebhook] failed:', e.message);
+  }
+}
 
 module.exports = router;

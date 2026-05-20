@@ -10,7 +10,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL
+    password TEXT NOT NULL,
     role     TEXT NOT NULL DEFAULT 'user'  -- 'user' | 'astrologer'
   );
 
@@ -44,6 +44,13 @@ db.exec(`
     FOREIGN KEY (tier_id)  REFERENCES slot_tiers(id)
   );
 `);
+
+// Migrate older DBs created before the role column existed
+const userColumns = db.prepare('PRAGMA table_info(users)').all();
+if (userColumns.length > 0 && !userColumns.some((c) => c.name === 'role')) {
+  db.exec(`ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'`);
+  console.log('[db] Added missing users.role column');
+}
 
 // Seed tiers only if table is empty
 const tierCount = db.prepare('SELECT COUNT(*) as c FROM slot_tiers').get().c;
