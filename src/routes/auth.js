@@ -1,75 +1,57 @@
-const express = require('express');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const db = require('../db');
+const express  = require('express');
+const router   = express.Router();
+const bcrypt   = require('bcryptjs');
+const jwt      = require('jsonwebtoken');
+const { v4: uuidv4 } = require('uuid');
+const db       = require('../db');
+const authMiddleware  = require('../middleware/auth');
+const { blockToken }  = require('../services/tokenBlocklist');
 
-const router = express.Router();
+router.post('/register', async (req, res) => {
+  const { username, password, role = 'user' } = req.body;
 
-const generateToken = (user) => {
-  return jwt.sign(
-    { id: user.id, username: user.username },
+  // Validate role — don't let someone self-assign astrologer in production
+  // For now we allow it since there's no admin panel yet
+  const allowedRoles = ['user', 'astrologer'];
+  if (!allowedRoles.includes(role)) {
+    return res.status(400).json({ error: 'Invalid role' });
+  }
+
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    db.prepare('INSERT INTO users (username, password, role) VALUES (?, ?, ?)')
+      .run(username, hash, role);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(400).json({ error: 'Username already taken' });
+  }
+});
+
+router.post('/login', async (req, res) => {
+  const { username, password } = req.body;
+  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+
+  const valid = await bcrypt.compare(password, user.password);
+  if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+
+  const jti   = uuidv4();
+  const token = jwt.sign(
+    { id: user.id, username: user.username, role: user.role, jti }, // role in JWT
     process.env.JWT_SECRET,
     { expiresIn: '7d' }
   );
-};
 
-// POST /auth/register
-router.post('/register', async (req, res) => {
-  const { username, password } = req.body;
-
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password required' });
-  }
-
-  try {
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const stmt = db.prepare('INSERT INTO users (username, password) VALUES (?, ?)');
-    const result = stmt.run(username, hashedPassword);
-
-    const user = { id: result.lastInsertRowid, username };
-    const token = generateToken(user);
-
-    return res.status(201).json({ token, user });
-  } catch (err) {
-    if (err.message.includes('UNIQUE constraint failed')) {
-      return res.status(409).json({ error: 'Username already taken' });
-    }
-    return res.status(500).json({ error: 'Server error' });
-  }
+  res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
 });
 
-// POST /auth/login
-router.post('/login', async (req, res) => {
-  const { username, password } = req.body;
-
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password required' });
+// Fix 10 — logout blocklists the token immediately
+router.post('/logout', authMiddleware, (req, res) => {
+  const { jti, exp } = req.user;
+  if (jti) {
+    blockToken(jti, exp * 1000); // exp is in seconds, convert to ms
   }
-
-  try {
-    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-
-    if (!user) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const match = await bcrypt.compare(password, user.password);
-    if (!match) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const token = generateToken(user);
-    return res.json({ token, user: { id: user.id, username: user.username } });
-  } catch (err) {
-    return res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// GET /auth/me
-router.get('/me', require('../middleware/auth'), (req, res) => {
-  const user = db.prepare('SELECT id, username, created_at FROM users WHERE id = ?').get(req.user.id);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  return res.json({ user });
+  res.json({ success: true });
 });
 
 module.exports = router;

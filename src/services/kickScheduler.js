@@ -1,6 +1,5 @@
 const { RoomServiceClient } = require('livekit-server-sdk');
 
-// Map of payment_ref -> { kickTimer, warnTimer }
 const activeTimers = new Map();
 
 const roomService = new RoomServiceClient(
@@ -9,60 +8,57 @@ const roomService = new RoomServiceClient(
   process.env.LIVEKIT_API_SECRET
 );
 
-/**
- * Schedule a warning Data Message + kick for a slot.
- *
- * @param {object} opts
- * @param {string} opts.roomName
- * @param {string} opts.participantIdentity  - "user_{id}" string
- * @param {string} opts.paymentRef
- * @param {number} opts.endsAt               - Unix ms timestamp
- * @param {function} opts.onKick             - called after kick (to update DB)
- */
 function scheduleKick({ roomName, participantIdentity, paymentRef, endsAt, onKick }) {
-  // Clear any existing timers for this ref (handles extensions)
   cancelKick(paymentRef);
 
-  const now       = Date.now();
-  const msLeft    = endsAt - now;
-  const warnMs    = msLeft - 5 * 60 * 1000; // 5 min before end
+  const now    = Date.now();
+  const msLeft = endsAt - now;
+  const warnMs = msLeft - 5 * 60 * 1000;
+
+  // Fix 2 — handle already-expired slots immediately
+  if (msLeft <= 0) {
+    console.warn(`[kickScheduler] Slot already expired for ${participantIdentity}, kicking now`);
+    _doKick(roomName, participantIdentity, paymentRef, onKick);
+    return;
+  }
 
   const timers = {};
 
-  // 5-minute warning via LiveKit Data Message
   if (warnMs > 0) {
     timers.warnTimer = setTimeout(async () => {
       try {
         const payload = Buffer.from(JSON.stringify({
-          type: 'SLOT_WARNING',
+          type:    'SLOT_WARNING',
           message: '5 minutes remaining in your time slot!',
           endsAt,
         }));
-        await roomService.sendData(roomName, payload, 0 /* RELIABLE */, {
+        await roomService.sendData(roomName, payload, 0, {
           destinationIdentities: [participantIdentity],
         });
       } catch (e) {
-        console.warn(`[kickScheduler] Warning send failed for ${participantIdentity}:`, e.message);
+        console.warn(`[kickScheduler] Warning send failed:`, e.message);
       }
     }, warnMs);
   }
 
-  // Hard kick at endsAt
-  timers.kickTimer = setTimeout(async () => {
-    try {
-      await roomService.removeParticipant(roomName, participantIdentity);
-      console.log(`[kickScheduler] Kicked ${participantIdentity} from ${roomName}`);
-    } catch (e) {
-      // Participant may have already left — not an error worth crashing over
-      console.warn(`[kickScheduler] Kick failed (already left?):`, e.message);
-    } finally {
-      activeTimers.delete(paymentRef);
-      if (onKick) onKick();
-    }
+  timers.kickTimer = setTimeout(() => {
+    _doKick(roomName, participantIdentity, paymentRef, onKick);
   }, msLeft);
 
   activeTimers.set(paymentRef, timers);
-  console.log(`[kickScheduler] Scheduled kick for ${participantIdentity} in ${Math.round(msLeft/1000)}s`);
+  console.log(`[kickScheduler] Scheduled kick for ${participantIdentity} in ${Math.round(msLeft / 1000)}s`);
+}
+
+async function _doKick(roomName, participantIdentity, paymentRef, onKick) {
+  try {
+    await roomService.removeParticipant(roomName, participantIdentity);
+    console.log(`[kickScheduler] Kicked ${participantIdentity} from ${roomName}`);
+  } catch (e) {
+    console.warn(`[kickScheduler] Kick failed (already left?):`, e.message);
+  } finally {
+    activeTimers.delete(paymentRef);
+    if (onKick) onKick();
+  }
 }
 
 function cancelKick(paymentRef) {
@@ -71,8 +67,39 @@ function cancelKick(paymentRef) {
     clearTimeout(existing.kickTimer);
     clearTimeout(existing.warnTimer);
     activeTimers.delete(paymentRef);
-    console.log(`[kickScheduler] Cancelled timers for ref ${paymentRef}`);
+    console.log(`[kickScheduler] Cancelled timers for ${paymentRef}`);
   }
 }
 
-module.exports = { scheduleKick, cancelKick };
+// Fix 1 — rebuild all timers on server startup
+// Call this once from index.js after DB is ready
+function restoreTimersFromDB(db) {
+  const activeSlots = db.prepare(`
+    SELECT s.*, r.name as room_name
+    FROM slots s
+    JOIN rooms r ON s.room_id = r.id
+    WHERE s.is_active = 1
+      AND s.ends_at > ?
+  `).all(Date.now());
+
+  if (activeSlots.length === 0) {
+    console.log('[kickScheduler] No active slots to restore');
+    return;
+  }
+
+  console.log(`[kickScheduler] Restoring ${activeSlots.length} kick timer(s) after restart`);
+
+  for (const slot of activeSlots) {
+    scheduleKick({
+      roomName:            slot.room_name,
+      participantIdentity: `user_${slot.user_id}`,
+      paymentRef:          slot.payment_ref,
+      endsAt:              slot.ends_at,
+      onKick: () => {
+        db.prepare('UPDATE slots SET is_active = 0 WHERE id = ?').run(slot.id);
+      },
+    });
+  }
+}
+
+module.exports = { scheduleKick, cancelKick, restoreTimersFromDB };

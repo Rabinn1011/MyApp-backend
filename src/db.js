@@ -11,6 +11,7 @@ db.exec(`
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
     password TEXT NOT NULL
+    role     TEXT NOT NULL DEFAULT 'user'  -- 'user' | 'astrologer'
   );
 
   CREATE TABLE IF NOT EXISTS rooms (

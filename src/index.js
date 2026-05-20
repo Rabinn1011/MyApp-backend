@@ -1,23 +1,38 @@
+const express   = require('express');
+const rateLimit = require('express-rate-limit');
 require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-
-const authRoutes = require('./routes/auth');
-const livekitRoutes = require('./routes/livekit');
 
 const app = express();
-
-app.use(cors());
 app.use(express.json());
 
-// Routes
-app.use('/auth', authRoutes);
-app.use('/livekit', livekitRoutes);
+// Fix 9 — rate limiters
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,  // 15 minutes
+  max: 20,                    // 20 attempts per window
+  message: { error: 'Too many attempts, please try again later' },
+});
 
-// Health check
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,        // 1 minute
+  max: 60,                    // 60 requests per minute
+  message: { error: 'Too many requests' },
+});
+
+// Apply auth limiter to login/register only
+app.use('/auth', authLimiter);
+
+// Apply general limiter to everything else
+app.use('/livekit', apiLimiter);
+app.use('/payment', apiLimiter);
+
+app.use('/auth',    require('./routes/auth'));
+app.use('/livekit', require('./routes/livekit'));
+app.use('/payment', require('./routes/payment'));
+
+// Fix 1 — restore kick timers after restart
+const db = require('./db');
+const { restoreTimersFromDB } = require('./services/kickScheduler');
+restoreTimersFromDB(db);
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
